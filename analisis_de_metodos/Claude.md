@@ -632,3 +632,374 @@ Branding del gimnasio
 
 Esfuerzo total Fase 2: ~17 semanas
 ROI: Producto para boxes/estudios con múltiples coaches
+
+
+## Parte 2 
+
+1) Esquema de Google Sheets (creá un spreadsheet llamado CoachingSystem)
+
+Crea estas hojas (tabs) con las columnas exactas — pegá la primera fila tal cual:
+
+Hoja: atletas
+
+id | nombre | email | plan_id | squat_tm | bench_tm | dead_tm | press_tm | activo | fecha_inicio
+
+
+Hoja: planes_disponibles
+
+plan_id | nombre_plan | descripcion | ciclo_duracion_semanas | activo
+
+
+Hoja: programa_<<plan_id>>
+(una hoja por plan, por ejemplo programa_531, programa_BBB, programa_GZCL)
+
+plan_id | ciclo | semana | dia | lift | set_num | intensidad | reps_objetivo | tipo_set
+
+
+Hoja: sesiones_programadas (se genera con script)
+
+alumno_id | nombre | plan_id | ciclo | semana | dia | lift | set_num | peso_programado | reps_objetivo | fecha_generada
+
+
+Hoja: registro_real (lo que envía el Form)
+
+timestamp | alumno_id | nombre | plan_id | lift | peso_levantado | reps_completadas | rpe | subir_video (Sí/No) | video_file_id | observaciones
+
+
+Hoja: videos
+
+alumno_id | nombre | lift | fecha | url | revisado | feedback | video_file_id
+
+2) Google Form — campos y buenas prácticas
+
+Configura el Form con estos campos (orden lógico). Usá nombres de campo exactos para que e.namedValues en Apps Script los encuente:
+
+Atleta (dropdown — listá nombre (id) o solo nombre; idealmente nombre_id si hay duplicados)
+
+Lift (dropdown: Squat, Bench, Deadlift, Press)
+
+Peso levantado (número)
+
+Reps completadas (número)
+
+RPE (escala 1-10)
+
+¿Subir video? (Sí / No)
+
+Video (upload de archivos) — acepta .mp4, .mov, .avi / tamaño límite según plan
+
+Observaciones (texto libre)
+
+Nota: el campo de upload guarda el ID del archivo en la respuesta. Ideal usar Atleta como dropdown que coincide con tu hoja atletas.
+
+3) Apps Script — pega todo en Extensions → Apps Script
+
+Crea un nuevo proyecto y pega todo esto. Luego guarda. (El script usa namedValues para evitar dependencias de índices.)
+
+/** CONFIG **/
+const ROOT_FOLDER_NAME = "CoachingSystem";
+const TIMEZONE = "America/Argentina/Buenos_Aires"; // zona horaria para timestamps
+
+/* ---------- UTILIDADES ---------- */
+function _getSS() {
+  return SpreadsheetApp.getActiveSpreadsheet();
+}
+function _fmtDate(date) {
+  return Utilities.formatDate(date, "GMT-3", "yyyy-MM-dd HH:mm:ss");
+}
+
+/* ---------- GENERAR SESIONES PROGRAMADAS ---------- */
+function generarSesionesProgramadas() {
+  var ss = _getSS();
+  var atletasS = ss.getSheetByName("atletas");
+  if (!atletasS) throw "No existe la hoja 'atletas'";
+  var atletas = atletasS.getDataRange().getValues();
+  
+  var outS = ss.getSheetByName("sesiones_programadas");
+  if (!outS) outS = ss.insertSheet("sesiones_programadas");
+  outS.clear();
+  outS.appendRow(["alumno_id","nombre","plan_id","ciclo","semana","dia","lift","set_num","peso_programado","reps_objetivo","fecha_generada"]);
+  
+  // índice de columnas de atletas - asume cabecera en fila 1
+  var headers = atletas[0].map(h => (h||"").toString().toLowerCase());
+  var idx = (name) => headers.indexOf(name) >= 0 ? headers.indexOf(name) : -1;
+  var idI = idx("id"), nombreI = idx("nombre"), planI = idx("plan_id"), activoI = idx("activo"),
+      squatI = idx("squat_tm"), benchI = idx("bench_tm"), deadI = idx("dead_tm"), pressI = idx("press_tm");
+  
+  for (var i=1;i<atletas.length;i++) {
+    var row = atletas[i];
+    if (!row[activoI] || row[activoI].toString().toLowerCase() !== "true") continue;
+    var alumno_id = row[idI];
+    var nombre = row[nombreI];
+    var plan_id = row[planI];
+    if (!plan_id) continue;
+    
+    var template = ss.getSheetByName("programa_" + plan_id);
+    if (!template) continue;
+    var templRows = template.getDataRange().getValues();
+    var templHeader = templRows[0].map(h => (h||"").toString().toLowerCase());
+    var liftI = templHeader.indexOf("lift"), cicloI = templHeader.indexOf("ciclo"),
+        semanaI = templHeader.indexOf("semana"), diaI = templHeader.indexOf("dia"),
+        setnumI = templHeader.indexOf("set_num"), intensidadI = templHeader.indexOf("intensidad"),
+        repsI = templHeader.indexOf("reps_objetivo");
+    
+    for (var j=1;j<templRows.length;j++) {
+      var t = templRows[j];
+      var lift = t[liftI];
+      var intensidad = parseFloat(t[intensidadI]) || 0;
+      var tm = _obtenerTMPorNombre(row, lift, {squatI,benchI,deadI,pressI});
+      var peso_programado = Math.round(tm * intensidad * 10)/10;
+      outS.appendRow([
+        alumno_id,
+        nombre,
+        plan_id,
+        t[cicloI],
+        t[semanaI],
+        t[diaI],
+        lift,
+        t[setnumI],
+        peso_programado,
+        t[repsI],
+        _fmtDate(new Date())
+      ]);
+    }
+  }
+}
+
+function _obtenerTMPorNombre(atletaRow, lift, idxObj) {
+  var liftLow = lift.toString().toLowerCase();
+  if (liftLow.indexOf("squat") !== -1) return atletaRow[idxObj.squatI] || 0;
+  if (liftLow.indexOf("bench") !== -1) return atletaRow[idxObj.benchI] || 0;
+  if (liftLow.indexOf("dead") !== -1) return atletaRow[idxObj.deadI] || 0;
+  if (liftLow.indexOf("press") !== -1) return atletaRow[idxObj.pressI] || 0;
+  return 0;
+}
+
+/* ---------- ON FORM SUBMIT ---------- */
+/* Recomendado: configurar trigger installable "From form" -> onFormSubmit */
+function onFormSubmit(e) {
+  // e.namedValues es más robusto
+  var nv = e.namedValues;
+  var timestamp = nv["Timestamp"] ? nv["Timestamp"][0] : new Date();
+  var atleta = (nv["Atleta"] || [""])[0];
+  var lift = (nv["Lift"] || [""])[0];
+  var peso = (nv["Peso levantado"] || [""])[0];
+  var reps = (nv["Reps completadas"] || [""])[0];
+  var rpe = (nv["RPE"] || [""])[0];
+  var subirVideo = (nv["¿Subir video?"] || ["No"])[0];
+  var videoFiles = nv["Video"] || []; // array de URLs o IDs (depende config)
+  var observaciones = (nv["Observaciones"] || [""])[0];
+  
+  // Parse atleta para id/nombre si lo guardás como "Nombre (id)" podrías parsear
+  var alumno_id = _parseIdFromAtletaField(atleta);
+  var nombre = _parseNombreFromAtletaField(atleta);
+  
+  // Guardar en registro_real
+  var ss = _getSS();
+  var reg = ss.getSheetByName("registro_real");
+  if (!reg) reg = ss.insertSheet("registro_real");
+  reg.appendRow([_fmtDate(new Date(timestamp)), alumno_id, nombre, "", lift, peso, reps, rpe, subirVideo, (videoFiles[0] || ""), observaciones]);
+  
+  // Si hay video, organizar (si el Form devolvió file ID o file URL)
+  if (subirVideo.toString().toLowerCase() === "sí" || subirVideo.toString().toLowerCase() === "si") {
+    var videoFileId = _extractFileId(videoFiles[0]);
+    if (videoFileId) {
+      var url = organizarVideo(alumno_id, nombre, lift, videoFileId);
+      // Guardar en hoja videos
+      var videosS = ss.getSheetByName("videos");
+      if (!videosS) videosS = ss.insertSheet("videos");
+      videosS.appendRow([alumno_id, nombre, lift, _fmtDate(new Date(timestamp)), url, "FALSE", "", videoFileId]);
+      // Notificar
+      enviarNotificacionVideoNuevo(nombre, lift, url);
+    }
+  }
+}
+
+/* ---------- ORGANIZAR VIDEO ---------- */
+function organizarVideo(alumno_id, nombre, lift, videoFileId) {
+  var file = DriveApp.getFileById(videoFileId);
+  var rootFolders = DriveApp.getFoldersByName(ROOT_FOLDER_NAME);
+  var root = rootFolders.hasNext() ? rootFolders.next() : DriveApp.createFolder(ROOT_FOLDER_NAME);
+  var atletasFolder = _buscarOCrearCarpeta(root, "Atletas");
+  var safeName = (nombre || ("id_" + alumno_id)).replace(/ /g, "_") + "_id_" + alumno_id;
+  var carpetaAtleta = _buscarOCrearCarpeta(atletasFolder, safeName);
+  var carpetaVideos = _buscarOCrearCarpeta(carpetaAtleta, "Videos");
+  var hoy = new Date();
+  var mesAnio = Utilities.formatDate(hoy, "GMT-3", "yyyy-MM");
+  var carpetaMes = _buscarOCrearCarpeta(carpetaVideos, mesAnio);
+  var timestamp = Utilities.formatDate(hoy, "GMT-3", "yyyy-MM-dd_HH-mm");
+  var ext = _getExtension(file.getName()) || "mp4";
+  var nuevoNombre = lift.toString().toLowerCase() + "_" + timestamp + "." + ext;
+  file.setName(nuevoNombre);
+  carpetaMes.addFile(file);
+  // remover de carpeta raíz del uploader si existe en otra
+  // (no hacemos file.removeFromFolder para no perder en drive)
+  return file.getUrl();
+}
+
+function _buscarOCrearCarpeta(parent, name) {
+  var it = parent.getFoldersByName(name);
+  if (it.hasNext()) return it.next();
+  return parent.createFolder(name);
+}
+function _getExtension(name) {
+  var m = name.match(/\.([a-zA-Z0-9]+)$/);
+  return m ? m[1] : null;
+}
+function _extractFileId(fileField) {
+  if (!fileField) return null;
+  // si es URL de Drive, extraer id
+  var m = fileField.match(/[-\w]{25,}/);
+  return m ? m[0] : fileField; // si ya es id, lo usa
+}
+function _parseIdFromAtletaField(atletaField) {
+  if (!atletaField) return "";
+  var m = atletaField.match(/_id_(\d+)/);
+  if (m) return m[1];
+  // si no está, podés mapear buscando en la hoja 'atletas'
+  var ss = _getSS(), s = ss.getSheetByName("atletas");
+  var vals = s.getDataRange().getValues();
+  for (var i=1;i<vals.length;i++){
+    if (vals[i][1] == atletaField) return vals[i][0]; // id col 0, nombre col 1
+  }
+  return "";
+}
+function _parseNombreFromAtletaField(atletaField) {
+  if (!atletaField) return "";
+  var m = atletaField.match(/^(.*?)_id_/);
+  if (m) return m[1].replace(/_/g," ");
+  // fallback
+  return atletaField;
+}
+
+/* ---------- NOTIFICACIONES ---------- */
+function enviarNotificacionVideoNuevo(alumno_nombre, lift, url) {
+  var mensaje = "🎥 Nuevo video: " + alumno_nombre + " - " + lift + "\n" + url;
+  // Email
+  MailApp.sendEmail("tu_email@gmail.com", "Nuevo video para revisar", mensaje);
+  // Aquí podés añadir Telegram/Slack/WhatsApp (API)
+}
+
+/* ---------- ONBOARDING: crear carpeta atleta + copiar template ---------- */
+function crearCarpetaAtleta(id, nombre) {
+  var rootFolders = DriveApp.getFoldersByName(ROOT_FOLDER_NAME);
+  var root = rootFolders.hasNext() ? rootFolders.next() : DriveApp.createFolder(ROOT_FOLDER_NAME);
+  var atletasFolder = _buscarOCrearCarpeta(root, "Atletas");
+  var safeName = (nombre || ("id_" + id)).replace(/ /g, "_") + "_id_" + id;
+  var carpetaAtleta = _buscarOCrearCarpeta(atletasFolder, safeName);
+  _buscarOCrearCarpeta(carpetaAtleta, "Videos");
+  _buscarOCrearCarpeta(carpetaAtleta, "Docs");
+  return carpetaAtleta.getUrl();
+}
+
+/* ---------- POLLING (opcional) para carpeta compartida: mover archivos nuevos ---------- */
+/* Si preferís que atletas suban a una carpeta pública y procesarla, podés ejecutar esto periódicamente */
+function procesarCarpetaShared(sharedFolderId) {
+  var folder = DriveApp.getFolderById(sharedFolderId);
+  var files = folder.getFiles();
+  while (files.hasNext()) {
+    var f = files.next();
+    var name = f.getName(); // formato esperado: id_lift_fecha.mp4
+    var partes = name.split("_");
+    if (partes.length >= 2) {
+      var alumno_id = partes[0];
+      var lift = partes[1];
+      organizarVideo(alumno_id, "", lift, f.getId());
+      folder.removeFile(f);
+    }
+  }
+}
+
+4) Triggers a configurar (desde Apps Script → Reloj / Triggers)
+
+onFormSubmit: trigger From form → onFormSubmit (installable)
+
+Autorizar scopes (Drive, Mail, Sheets).
+
+generarSesionesProgramadas: trigger Time-driven → ejecutar diariamente (ej: 02:00) o cada mañana.
+
+procesarCarpetaShared (opcional): trigger Time-driven cada 5–15 min si usás carpeta pública para uploads.
+
+(Opcional) Trigger para enviar resumen semanal: crea función y schedule semanal.
+
+5) Drive — estructura y nomenclatura (copiá esto)
+/CoachingSystem
+  /Atletas
+    /Nombre_Apellido_id_1
+      /Videos
+        /2026-02
+          squat_2026-02-10_10-30.mp4
+      /Docs
+  /Programas
+    template_531.xlsx
+  /Reportes
+
+
+Nomenclatura archivo video: [lift]_[YYYY-MM-DD_HH-mm].mp4
+Carpeta atleta: Nombre_Apellido_id_<id> (esto evita duplicados)
+
+6) Looker Studio — conexión rápida
+
+Crear fuente de datos: conectar con Google Sheets → seleccionar CoachingSystem → hoja videos y/o registro_real.
+
+Crear un informe con:
+
+Tabla: Atleta | Lift | Fecha | RPE | Reps | Video (URL clicable) | Revisado
+
+Filtros: revisado = FALSE, RPE >= 8
+
+Gráficos: compliance (cantidad de registros / semana), progreso de TM (gráfico de series).
+
+7) Test rápido (5 minutos)
+
+Poblá atletas con un par de filas (usa ejemplos tuyos).
+
+Crea programa_531 con 3–5 rows de ejemplo (usa intensidades 0.65, 0.75, 0.85).
+
+Ejecutá manualmente generarSesionesProgramadas → verificá sesiones_programadas.
+
+Enviá una respuesta de prueba al Form con ¿Subir video? = Sí y subí un archivo pequeño.
+
+Verificá que:
+
+registro_real tiene la fila
+
+videos tiene la fila con URL
+
+El archivo queda en la carpeta correcta /Atletas/<nombre>_id_#/Videos/yyyy-mm/
+
+8) Checklist de despliegue (rápido)
+
+ Crear spreadsheet CoachingSystem y tabs con headers exactos.
+
+ Crear Google Form con los nombres exactos de campos.
+
+ Subir Apps Script, pegar código y guardar.
+
+ Establecer triggers (onFormSubmit, generarSesionesProgramadas).
+
+ Probar con 2 atletas y 1 upload.
+
+ Conectar Looker Studio a la hoja videos y registro_real.
+
+ Ajustar permisos de Drive (carpetas compartidas) y revisar cuotas de upload.
+
+9) Notas para producción / scaling rápido
+
+Límites Drive/Form: el upload por Form depende de la quota de Drive; para muchísimos videos conviene S3/Cloud Storage con integración o usar transcodificación.
+
+Autenticación: para integraciones (WhatsApp API, Telegram, Slack) podés crear funciones que llamen sus APIs desde Apps Script (UrlFetch), pero necesitarás tokens y manejo de costos.
+
+Costos: WhatsApp Business API y transcodificación generan gastos; para MVP usa email/Telegram.
+
+Seguridad: usa IDs en nombres de carpeta para evitar exposición de PII. Considerá permisos restringidos en la carpeta raíz.
+
+Backups: exportá registro_real semanalmente a BigQuery/CSV si querés análisis avanzado.
+
+10) Mini-roadmap reproducible (qué lanzar primero)
+
+MVP (2 semanas): tracking + Form upload + Sheets + Looker Studio + notificaciones por email.
+
+Phase 2 (1–2 meses): multi-coach roles, recomendaciones TM (reglas heurísticas), polling de carpeta shared, onboarding automático.
+
+Phase 3 (2–3 meses): IA de video/pose, WhatsApp reminders, facturación (Stripe) y app móvil.
